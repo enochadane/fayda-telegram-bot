@@ -509,8 +509,8 @@ def create_a4_printable(composed_id: Image.Image) -> Image.Image:
     # card_width_mm  = 85.6   ← exact CR80 (use if your printer does NOT scale)
     # card_width_mm  = 88.0   ← +2.4 mm compensates for ~3% printer scaling
     # card_width_mm  = 90.0   ← +4.4 mm compensates for ~5% printer scaling
-    card_width_mm  = 88.0   # ← adjust this until printed width  == 8.5 cm
-    card_height_mm = 55.5   # ← adjust this until printed height == 5.4 cm
+    card_width_mm  = 86.0   # ← adjust this until printed width  == 8.5 cm
+    card_height_mm = 55.0   # ← adjust this until printed height == 5.4 cm
 
     target_w = int(card_width_mm  / 25.4 * dpi)   # 2772 px at 800 DPI
     target_h = int(card_height_mm / 25.4 * dpi)   # 1748 px at 800 DPI
