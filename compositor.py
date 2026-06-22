@@ -244,7 +244,7 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
     # Scale to fill the full silhouette width (matches physical card style).
     # === ZOOM CONTROL FOR MAIN PHOTO ===
     # Decrease this value to zoom out (e.g. 0.95), increase to zoom in (e.g. 1.05)
-    main_photo_zoom = 0.97
+    main_photo_zoom = 0.93
     
     scale = (photo_box_w / src_w) * main_photo_zoom
     new_w = int(photo_box_w * main_photo_zoom)
@@ -284,7 +284,7 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
     # Anchor the photo bottom at 92 % of the ghost box so face + shoulders show.
     # === ZOOM CONTROL FOR GHOST PHOTO ===
     # Decrease this value to zoom out (e.g. 0.95), increase to zoom in (e.g. 1.05)
-    ghost_photo_zoom = 0.78
+    ghost_photo_zoom = 0.75
     
     ghost_scale   = (ghost_w / src_w) * ghost_photo_zoom
     ghost_new_w   = int(ghost_w * ghost_photo_zoom)
@@ -518,7 +518,7 @@ def create_a4_printable(composed_id: Image.Image) -> Image.Image:
     # === A4 PRINT MARGIN CONTROL ===
     # Top margin in millimeters (e.g., 2.0 mm to avoid wasting PVC printing film at the top edge)
     # Set this to 0.0 if your printer supports full borderless printing.
-    top_margin_mm = 0.0
+    top_margin_mm = 0.5
 
     # True centering: place the cutting GAP at the exact horizontal midpoint of the A4 page.
     # This means the front card ends at the page center, and the back card starts at the page center.
