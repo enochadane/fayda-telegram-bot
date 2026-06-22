@@ -482,55 +482,75 @@ def mirror_image(image: Image.Image) -> Image.Image:
 
 def create_a4_printable(composed_id: Image.Image) -> Image.Image:
     """
-    Place the mirrored front and back ID cards side-by-side at the top of an A4 portrait page,
-    resizing them to the exact standard physical dimensions of a CR80 card (8.56 cm x 5.398 cm)
-    at 800 DPI, with a 5 mm cutting gap between them to avoid wasting lamination film.
+    Place the mirrored front and back ID cards side-by-side at the very top of an A4 portrait page.
+
+    - Card dimensions are slightly enlarged to compensate for typical printer scaling (~2-3%).
+    - A thin vertical fold guide line is drawn in the center of the gap for PVC film folding.
+    - The entire card block is horizontally centered on the A4 page.
     """
     dpi = 800.0
-    # Calculate A4 page dimensions in pixels
-    a4_w = int(210.0 / 25.4 * dpi)  # 6614 px
-    a4_h = int(297.0 / 25.4 * dpi)  # 9354 px
+    # A4 page dimensions in pixels at 800 DPI
+    a4_w = int(210.0 / 25.4 * dpi)   # 6614 px  = 210.0 mm
+    a4_h = int(297.0 / 25.4 * dpi)   # 9354 px  = 297.0 mm
 
-    # Create white canvas
     canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
 
-    # Extract front and back cards from the composed_id template
-    # composed_id is 5460 x 1710. Front is x=[0:2727], Back is x=[2739:5459]
-    front_card = composed_id.crop((0, 0, 2727, 1710))
-    back_card = composed_id.crop((2739, 0, 5459, 1710))
+    # Extract front and back halves from the combined template image
+    # Template is 5460 x 1710 px: front=x[0:2727], back=x[2739:5459]
+    front_card = composed_id.crop((0,    0, 2727, 1710))
+    back_card  = composed_id.crop((2739, 0, 5459, 1710))
 
-    # Standard CR80 card physical dimensions at 800 DPI:
-    # Width:  85.60 mm / 25.4 = 3.370 in -> 2696 px
-    # Height: 53.98 mm / 25.4 = 2.125 in -> 1700 px
-    target_w = 2696
-    target_h = 1700
+    # ── CARD SIZE CONTROL ──────────────────────────────────────────────────────
+    # Standard CR80 physical card: 85.6 mm × 53.98 mm
+    # Most home/office printers scale PDFs down by 2-5%, so we increase the
+    # dimensions here to compensate. Adjust until the printed card matches the
+    # physical card when you print at "Actual Size / 100%".
+    #
+    # card_width_mm  = 85.6   ← exact CR80 (use if your printer does NOT scale)
+    # card_width_mm  = 88.0   ← +2.4 mm compensates for ~3% printer scaling
+    # card_width_mm  = 90.0   ← +4.4 mm compensates for ~5% printer scaling
+    card_width_mm  = 88.0   # ← adjust this until printed width  == 8.5 cm
+    card_height_mm = 55.5   # ← adjust this until printed height == 5.4 cm
+
+    target_w = int(card_width_mm  / 25.4 * dpi)   # 2772 px at 800 DPI
+    target_h = int(card_height_mm / 25.4 * dpi)   # 1748 px at 800 DPI
 
     front_resized = front_card.resize((target_w, target_h), Image.LANCZOS)
-    back_resized = back_card.resize((target_w, target_h), Image.LANCZOS)
+    back_resized  = back_card.resize((target_w, target_h), Image.LANCZOS)
 
-    # Mirror each card horizontally (essential for printing on PVC film/dragon sheets)
+    # Mirror each half (required for PVC film / dragon sheet printing)
     front_mirrored = mirror_image(front_resized)
-    back_mirrored = mirror_image(back_resized)
+    back_mirrored  = mirror_image(back_resized)
 
-    # 5 mm gap between the cards for easy cutting
-    gap = int(5.0 / 25.4 * dpi)  # ~157 px
+    # ── GAP & TOP MARGIN ──────────────────────────────────────────────────────
+    gap_mm        = 5.0    # gap between cards — space for the fold line
+    top_margin_mm = 2.0    # set to 0.0 for borderless printing
 
-    # === A4 PRINT MARGIN CONTROL ===
-    # Top margin in millimeters (e.g., 2.0 mm to avoid wasting PVC printing film at the top edge)
-    # Set this to 0.0 if your printer supports full borderless printing.
-    top_margin_mm = 2.0
-
-    # True centering: place the cutting GAP at the exact horizontal midpoint of the A4 page.
-    # This means the front card ends at the page center, and the back card starts at the page center.
-    # Both cards are therefore exactly symmetric around the page center line.
-    page_center = a4_w // 2
-    front_x = page_center - target_w - (gap // 2)
-    back_x  = page_center + (gap - gap // 2)      # handles odd gap correctly
+    gap      = int(gap_mm        / 25.4 * dpi)
     y_offset = int(top_margin_mm / 25.4 * dpi)
 
-    # Paste front and back cards symmetrically around the page center
+    # ── HORIZONTAL CENTERING ──────────────────────────────────────────────────
+    # Center the entire combined block (front + gap + back) on the A4 page.
+    total_width = target_w * 2 + gap
+    block_x     = (a4_w - total_width) // 2    # left edge of the combined block
+    front_x     = block_x
+    back_x      = block_x + target_w + gap
+
     canvas.paste(front_mirrored, (front_x, y_offset))
     canvas.paste(back_mirrored,  (back_x,  y_offset))
+
+    # ── FOLD GUIDE LINE ───────────────────────────────────────────────────────
+    # Draw a thin vertical line at the exact center of the gap.
+    # Fold the PVC film along this line to align front and back.
+    fold_x         = block_x + target_w + gap // 2   # center of the gap
+    fold_thickness = max(3, int(0.4 / 25.4 * dpi))   # 0.4 mm ≈ 13 px
+    fold_color     = (20, 20, 20)                     # near-black
+    draw = ImageDraw.Draw(canvas)
+    draw.line(
+        [(fold_x, y_offset), (fold_x, y_offset + target_h)],
+        fill=fold_color,
+        width=fold_thickness,
+    )
 
     return canvas
 
