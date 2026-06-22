@@ -518,7 +518,7 @@ def create_a4_printable(composed_id: Image.Image) -> Image.Image:
     # === A4 PRINT MARGIN CONTROL ===
     # Top margin in millimeters (e.g., 2.0 mm to avoid wasting PVC printing film at the top edge)
     # Set this to 0.0 if your printer supports full borderless printing.
-    top_margin_mm = 1.0
+    top_margin_mm = 2.0
 
     # True centering: place the cutting GAP at the exact horizontal midpoint of the A4 page.
     # This means the front card ends at the page center, and the back card starts at the page center.
