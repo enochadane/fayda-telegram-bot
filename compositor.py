@@ -482,26 +482,56 @@ def mirror_image(image: Image.Image) -> Image.Image:
 
 def create_a4_printable(composed_id: Image.Image) -> Image.Image:
     """
-    Place the mirrored ID card at the top of an A4 portrait page
-    keeping its original physical dimensions (at ~804.74 DPI).
+    Place the mirrored front and back ID cards side-by-side at the top of an A4 portrait page,
+    resizing them to the exact standard physical dimensions of a CR80 card (8.56 cm x 5.398 cm)
+    at 800 DPI, with a 5 mm cutting gap between them to avoid wasting lamination film.
     """
-    dpi = 804.74
+    dpi = 800.0
     # Calculate A4 page dimensions in pixels
-    a4_w = int(210.0 / 25.4 * dpi)  # 6653
-    a4_h = int(297.0 / 25.4 * dpi)  # 9409
+    a4_w = int(210.0 / 25.4 * dpi)  # 6614 px
+    a4_h = int(297.0 / 25.4 * dpi)  # 9354 px
 
     # Create white canvas
     canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
 
-    # Mirror the card first
-    mirrored = mirror_image(composed_id)
+    # Extract front and back cards from the composed_id template
+    # composed_id is 5460 x 1710. Front is x=[0:2727], Back is x=[2739:5459]
+    front_card = composed_id.crop((0, 0, 2727, 1710))
+    back_card = composed_id.crop((2739, 0, 5459, 1710))
 
-    # Center horizontally
-    x_offset = (a4_w - mirrored.width) // 2
-    # Place at top with 15mm margin
-    y_offset = int(15.0 / 25.4 * dpi)  # ~475 px
+    # Standard CR80 card physical dimensions at 800 DPI:
+    # Width:  85.60 mm / 25.4 = 3.370 in -> 2696 px
+    # Height: 53.98 mm / 25.4 = 2.125 in -> 1700 px
+    target_w = 2696
+    target_h = 1700
 
-    canvas.paste(mirrored, (x_offset, y_offset))
+    front_resized = front_card.resize((target_w, target_h), Image.LANCZOS)
+    back_resized = back_card.resize((target_w, target_h), Image.LANCZOS)
+
+    # Mirror each card horizontally (essential for printing on PVC film/dragon sheets)
+    front_mirrored = mirror_image(front_resized)
+    back_mirrored = mirror_image(back_resized)
+
+    # 5 mm gap between the cards for easy cutting
+    gap = int(5.0 / 25.4 * dpi)  # ~157 px
+
+    # === A4 PRINT MARGIN CONTROL ===
+    # Top margin in millimeters (e.g., 2.0 mm to avoid wasting PVC printing film at the top edge)
+    # Set this to 0.0 if your printer supports full borderless printing.
+    top_margin_mm = 0.0
+
+    # True centering: place the cutting GAP at the exact horizontal midpoint of the A4 page.
+    # This means the front card ends at the page center, and the back card starts at the page center.
+    # Both cards are therefore exactly symmetric around the page center line.
+    page_center = a4_w // 2
+    front_x = page_center - target_w - (gap // 2)
+    back_x  = page_center + (gap - gap // 2)      # handles odd gap correctly
+    y_offset = int(top_margin_mm / 25.4 * dpi)
+
+    # Paste front and back cards symmetrically around the page center
+    canvas.paste(front_mirrored, (front_x, y_offset))
+    canvas.paste(back_mirrored,  (back_x,  y_offset))
+
     return canvas
 
 

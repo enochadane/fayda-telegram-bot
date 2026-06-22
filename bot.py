@@ -312,7 +312,7 @@ async def generate_card_and_send(query: CallbackQuery, context: ContextTypes.DEF
         png_buf.seek(0)
 
         pdf_buf = io.BytesIO()
-        a4_canvas.save(pdf_buf, format="PDF", resolution=804.74)
+        a4_canvas.save(pdf_buf, format="PDF", resolution=800.0, quality=100)
         pdf_buf.seek(0)
 
         # Send the card as a visible photo in the chat
