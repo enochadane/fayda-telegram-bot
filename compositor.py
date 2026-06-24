@@ -28,7 +28,7 @@ Back half coordinate reference (relative x offset from BACK_OFFSET=2739):
 
 import io
 import os
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 import barcode
 from barcode.writer import ImageWriter
 
@@ -85,7 +85,7 @@ def _generate_barcode_image(fan_number: str,
         "font_size":     0,
         "text_distance": 0,
         "write_text":    False,
-        "dpi":           300,
+        "dpi":           600,
     }
 
     barcode_obj = code128(fan_number, writer=writer)
@@ -161,8 +161,61 @@ def _make_photo_silhouette_mask(template: Image.Image) -> Image.Image:
                 mx[x, y] = 255
 
     # A blur softens the silhouette edge
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=2))
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
     return mask
+
+
+def remove_white_background_smooth(img: Image.Image, tolerance: int = 30, use_min_filter: bool = True, min_filter_size: int = 3) -> Image.Image:
+    """
+    Remove the white background of the photo by performing a flood fill
+    from the top/left/right edges, making near-white pixels transparent.
+    Smoothes/feathers the edges using a small Gaussian blur on the mask.
+    """
+    img = img.convert("RGBA")
+    w, h = img.size
+    px = img.load()
+    
+    mask = Image.new("L", (w, h), 255)
+    mask_px = mask.load()
+    
+    visited = set()
+    queue = []
+    
+    # Start BFS from top, left, and right edges (avoid bottom edge where shirts are)
+    for x in range(w):
+        queue.append((x, 0))
+        visited.add((x, 0))
+    for y in range(1, h):
+        queue.append((0, y))
+        visited.add((0, y))
+        queue.append((w - 1, y))
+        visited.add((w - 1, y))
+        
+    head = 0
+    while head < len(queue):
+        cx, cy = queue[head]
+        head += 1
+        
+        mask_px[cx, cy] = 0
+        
+        for nx, ny in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]:
+            if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
+                r, g, b, a = px[nx, ny]
+                if r > 255 - tolerance and g > 255 - tolerance and b > 255 - tolerance:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+                    
+    # Optionally apply MinFilter to erode mask edges and eat the white halo
+    if use_min_filter:
+        mask = mask.filter(ImageFilter.MinFilter(min_filter_size))
+
+    # Smooth the mask using a small blur
+    mask_blurred = mask.filter(ImageFilter.GaussianBlur(radius=1.2))
+    
+    r, g, b, _ = img.split()
+    img_result = Image.merge("RGBA", (r, g, b, mask_blurred))
+    return img_result
+
 
 
 def _paste_rotated_text(canvas: Image.Image, text: str, font: ImageFont.FreeTypeFont,
@@ -235,42 +288,90 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
 
     # ── Position photo so the full portrait (head→shoulders) is visible ─────────
     #
-    # The bottom of the crop IS the bottom of the grey photo widget in the digital
-    # screenshot, which contains the person's shoulders/upper-torso.
-    # Anchoring the bottom of the photo at ~95% of the silhouette box height
-    # guarantees shoulders show up, regardless of how much empty grey space sits
-    # above the head in the source screenshot.
-    #
     # Scale to fill the full silhouette width (matches physical card style).
     # === ZOOM CONTROL FOR MAIN PHOTO ===
     # Decrease this value to zoom out (e.g. 0.95), increase to zoom in (e.g. 1.05)
     main_photo_zoom = 0.93
     
+    # Remove white background to prevent boxy edges and eat the white halo
+    photo_clean = remove_white_background_smooth(photo_image, tolerance=30, use_min_filter=True)
+    
     scale = (photo_box_w / src_w) * main_photo_zoom
     new_w = int(photo_box_w * main_photo_zoom)
     new_h = int(src_h * scale)
-    photo_resized = photo_image.resize((new_w, new_h), Image.LANCZOS)
-    if photo_resized.mode != "RGBA":
-        photo_resized = photo_resized.convert("RGBA")
+    photo_resized = photo_clean.resize((new_w, new_h), Image.LANCZOS)
+
+    # ── Photo processing: convert to grayscale + enhance ──────────────────
+    # Physical Ethiopian ID cards print the portrait in black & white.
+    # Convert RGB channels to grayscale but preserve the alpha channel!
+    r_ch, g_ch, b_ch, a_ch = photo_resized.split()
+    photo_gray_l = Image.merge("RGB", (r_ch, g_ch, b_ch)).convert("L")
+    photo_gray_l = ImageEnhance.Contrast(photo_gray_l).enhance(1.15)  # subtle contrast boost
+    photo_gray_l = ImageEnhance.Sharpness(photo_gray_l).enhance(1.3)  # sharpen after resize
+    photo_resized = Image.merge("RGBA", (photo_gray_l, photo_gray_l, photo_gray_l, a_ch))
 
     # Place the BOTTOM of the photo at 99.9 % of the silhouette box height.
     # This way the shoulders sit near the bottom-centre of the silhouette and
     # the face / head naturally appear in the upper portion.
-    bottom_anchor = int(photo_box_h * 0.999)  # canvas y where photo bottom lands
+    bottom_anchor = int(photo_box_h * 1.05)  # canvas y where photo bottom lands
     y_offset = bottom_anchor - new_h          # where the photo TOP starts (can be negative)
     x_offset = (photo_box_w - new_w) // 2     # center horizontally
 
-    # Dynamically get background color of the photo to avoid seams (sample top-left corner)
-    bg_r, bg_g, bg_b = photo_image.getpixel((5, 5))[:3]
-    bg_color = (bg_r, bg_g, bg_b, 255)
-    photo_canvas = Image.new("RGBA", (photo_box_w, photo_box_h), bg_color)
+    # === PHOTO BACKGROUND: WAVE PATTERN FROM TEMPLATE ===
+    # Reconstruct the card's guilloché wave pattern behind the person.
+    # We reconstruct the entire photo box background (728 × 1104 px) by walking
+    # horizontally in steps of the wave period (13px) to find clean wave pixels
+    # at the left (< 215) and right (> 915) edges of the front template.
+    # Linear blending weights transition smoothly between the left and right sources,
+    # preserving the background's colors, phase, and vertical consistency without seams.
+    _WAVE_PERIOD = 13
+    _fb_path = os.path.join(os.path.dirname(os.path.abspath(template_path)), "front_blank.png")
+    _front_blank = Image.open(_fb_path).convert("RGB")
+
+    # Crop the photo box area from front_blank
+    _fb_crop = _front_blank.crop((photo_box_x1, photo_box_y1, photo_box_x2, photo_box_y2))
+    _bg_px = _fb_crop.load()
+    _orig_px = _front_blank.load()
+
+    # Precompute clean x positions and blending weights for each column
+    _x_map = []
+    for _x_rel in range(photo_box_w):
+        _x_abs = photo_box_x1 + _x_rel
+        
+        # Walk left to find clean pixel (< 215)
+        _x_left = _x_abs
+        while _x_left >= 215:
+            _x_left -= _WAVE_PERIOD
+            
+        # Walk right to find clean pixel (> 915)
+        _x_right = _x_abs
+        while _x_right <= 915:
+            _x_right += _WAVE_PERIOD
+            
+        _weight_left = (photo_box_w - 1 - _x_rel) / (photo_box_w - 1)
+        _weight_right = 1.0 - _weight_left
+        _x_map.append((_x_left, _x_right, _weight_left, _weight_right))
+
+    for _y_rel in range(photo_box_h):
+        _y_abs = photo_box_y1 + _y_rel
+        for _x_rel in range(photo_box_w):
+            _x_left, _x_right, _weight_left, _weight_right = _x_map[_x_rel]
+            
+            _r_l, _g_l, _b_l = _orig_px[_x_left, _y_abs]
+            _r_r, _g_r, _b_r = _orig_px[_x_right, _y_abs]
+            
+            _r = int(_r_l * _weight_left + _r_r * _weight_right)
+            _g = int(_g_l * _weight_left + _g_r * _weight_right)
+            _b = int(_b_l * _weight_left + _b_r * _weight_right)
+            
+            _bg_px[_x_rel, _y_rel] = (_r, _g, _b)
+
+    photo_canvas = _fb_crop.convert("RGBA")
     photo_canvas.paste(photo_resized, (x_offset, y_offset), photo_resized)
 
-    # Row-fill silhouette mask eliminates ghost patches inside the face area
-    sil_mask     = _make_photo_silhouette_mask(template)
-    sil_mask_box = sil_mask.crop((photo_box_x1, photo_box_y1,
-                                   photo_box_x2, photo_box_y2))
-    template.paste(photo_canvas, (photo_box_x1, photo_box_y1), sil_mask_box)
+    # Paste final composed photo box back into template
+    template.paste(photo_canvas.convert("RGB"), (photo_box_x1, photo_box_y1))
+
 
     # ── Step F1b: Ghost / watermark photo — semi-transparent portrait overlay ──
     # In the expected output the ghost portrait sits over the lower-right
@@ -286,14 +387,20 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
     # Decrease this value to zoom out (e.g. 0.95), increase to zoom in (e.g. 1.05)
     ghost_photo_zoom = 0.75
     
+    # For the ghost photo, also remove the white background to prevent a semi-transparent white box and eat the white halo
+    ghost_clean = remove_white_background_smooth(photo_image, tolerance=30, use_min_filter=True)
+    
     ghost_scale   = (ghost_w / src_w) * ghost_photo_zoom
     ghost_new_w   = int(ghost_w * ghost_photo_zoom)
     ghost_new_h   = int(src_h * ghost_scale)
-    ghost_resized = photo_image.resize((ghost_new_w, ghost_new_h), Image.LANCZOS)
-    if ghost_resized.mode != "RGBA":
-        ghost_resized = ghost_resized.convert("RGBA")
+    ghost_resized = ghost_clean.resize((ghost_new_w, ghost_new_h), Image.LANCZOS)
+    
+    # Ghost also in grayscale for consistency with the main photo
+    g_r, g_g, g_b, g_a = ghost_resized.split()
+    ghost_gray_l = Image.merge("RGB", (g_r, g_g, g_b)).convert("L")
+    ghost_resized = Image.merge("RGBA", (ghost_gray_l, ghost_gray_l, ghost_gray_l, g_a))
 
-    ghost_bottom_anchor = int(ghost_h * 0.999)
+    ghost_bottom_anchor = int(ghost_h * 1.05)
     ghost_y_offset      = ghost_bottom_anchor - ghost_new_h   # can be negative
     ghost_x_offset      = (ghost_w - ghost_new_w) // 2     # center horizontally
 
@@ -317,7 +424,7 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
     font_field_am = _load_font(ETHIOPIC_FONT, 70)   # Other Amharic field values
     font_field_en = _load_font(SANS_FONT,     68)   # Other English field values
     font_fan_num  = _load_font(SANS_FONT,     60)   # FAN digits
-    font_doi      = _load_font(SANS_FONT,     40)   # Date-of-issue (rotated)
+    font_doi      = _load_font(SANS_FONT,     42)  # Date-of-issue (rotated) — compact to fit left-edge strip
 
     text_color = (25, 25, 25, 255)   # Near-black for all fields
     text_x     = 1060                # Left edge of all front-half text columns
@@ -330,16 +437,16 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
 
     # ── Date of Birth ─────────────────────────────────────────────────────────
     _draw_bold(draw, (text_x, 800), data["date_of_birth"],
-               text_color, font_field_en, stroke=2)
+               text_color, font_field_en, stroke=1)
 
     # ── Sex ───────────────────────────────────────────────────────────────────
     sex_text = f'{data["sex_amharic"]}  |  {data["sex_english"]}'
     _draw_bold(draw, (text_x, 960), sex_text,
-               text_color, font_field_am, stroke=2)
+               text_color, font_field_am, stroke=1)
 
     # ── Date of Expiry ────────────────────────────────────────────────────────
     _draw_bold(draw, (text_x, 1125), data["date_of_expiry"],
-               text_color, font_field_en, stroke=2)
+               text_color, font_field_en, stroke=1)
 
     # ── Step F3: FAN number + barcode ─────────────────────────────────────────
     #
@@ -399,10 +506,10 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
         # Both aligned horizontally to center at x_center=63 in line with pre-printed labels
         if gregorian_doi:
             _paste_rotated_text(template, gregorian_doi, font_doi,
-                                doi_color, x_center=63, y=680, align_bottom=True, stroke=1)
+                                doi_color, x_center=63, y=680, align_bottom=True, stroke=2)
         if ethiopian_doi:
             _paste_rotated_text(template, ethiopian_doi, font_doi,
-                                doi_color, x_center=63, y=1010, align_bottom=False, stroke=1)
+                                doi_color, x_center=63, y=1010, align_bottom=False, stroke=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # BACK HALF  (all absolute x = BACK_OFFSET + relative_x)
@@ -423,7 +530,7 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
 
     # ── Phone Number  (label y=90–130 → value below) ──────────────────────────
     _draw_bold(draw, (back_text_x, 145), data["phone_number"],
-               text_color, font_phone, stroke=2)
+               text_color, font_phone, stroke=1)
 
     # ── Nationality: already pre-printed on template — do NOT write again ─────
 
@@ -436,15 +543,15 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
 
     for am_text, en_text, y_am, y_en in address_coords:
         _draw_bold(draw, (back_text_x, y_am), am_text,
-                   text_color, font_addr_am, stroke=2)
+                   text_color, font_addr_am, stroke=1)
         _draw_bold(draw, (back_text_x, y_en), en_text,
-                   text_color, font_addr_en, stroke=2)
+                   text_color, font_addr_en, stroke=1)
 
     # ── FIN number  (white box: rel x=95–749, y=1362–1623) ────────────────────
     fin_x = B + 430   # after the "ፋይዳ ልዩ ቁጥር / FIN" pre-printed labels
     fin_y = 1390
     _draw_bold(draw, (fin_x, fin_y), data["fin"],
-               text_color, font_fin, stroke=2)
+               text_color, font_fin, stroke=1)
 
     # ── SN (Serial Number)  (white box: rel x=2061–2688, y=1530–1628) ──────────
     import hashlib
@@ -480,57 +587,53 @@ def mirror_image(image: Image.Image) -> Image.Image:
     return image.transpose(Image.FLIP_LEFT_RIGHT)
 
 
-def create_a4_printable(composed_id: Image.Image) -> Image.Image:
+def create_a4_printable(composed_id: Image.Image) -> tuple:
     """
     Place the mirrored front and back ID cards side-by-side at the very top of an A4 portrait page.
 
-    - Card dimensions are slightly enlarged to compensate for typical printer scaling (~2-3%).
+    - Card dimensions are mathematically aligned to native resolution to prevent resizing blur.
     - A thin vertical fold guide line is drawn in the center of the gap for PVC film folding.
     - The entire card block is horizontally centered on the A4 page.
     """
-    dpi = 800.0
-    # A4 page dimensions in pixels at 800 DPI
-    a4_w = int(210.0 / 25.4 * dpi)   # 6614 px  = 210.0 mm
-    a4_h = int(297.0 / 25.4 * dpi)   # 9354 px  = 297.0 mm
+    # ── CARD SIZE CONTROL ──────────────────────────────────────────────────────
+    # Standard CR80 physical card: 85.6 mm × 53.98 mm
+    # Most home/office printers scale PDFs down by 2-5%.
+    # We increase the target dimensions to compensate for typical printer scaling.
+    # Adjust card_width_mm until your printer prints it at exactly 85.6 mm.
+    card_width_mm = 88.5   # ← increase if printed card is too small, decrease if too large
+    
+    # We crop both front and back halves at exactly 2727 x 1710 pixels.
+    # To avoid resizing blur, we do NOT scale the cards. Instead, we dynamically
+    # calculate the PDF's DPI so that 2727 pixels renders at card_width_mm.
+    dpi = (2727.0 * 25.4) / card_width_mm  # e.g., 782.66 DPI for 88.5 mm
+
+    # A4 page dimensions in pixels at dynamic DPI
+    a4_w = int(210.0 / 25.4 * dpi)   # ~6470 px = 210.0 mm
+    a4_h = int(297.0 / 25.4 * dpi)   # ~9152 px = 297.0 mm
 
     canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
 
-    # Extract front and back halves from the combined template image
-    # Template is 5460 x 1710 px: front=x[0:2727], back=x[2739:5459]
+    # Extract front and back halves from the combined template image.
+    # We crop them both to exactly 2727 px wide to keep them identical in size.
     front_card = composed_id.crop((0,    0, 2727, 1710))
-    back_card  = composed_id.crop((2739, 0, 5459, 1710))
-
-    # ── CARD SIZE CONTROL ──────────────────────────────────────────────────────
-    # Standard CR80 physical card: 85.6 mm × 53.98 mm
-    # Most home/office printers scale PDFs down by 2-5%, so we increase the
-    # dimensions here to compensate. Adjust until the printed card matches the
-    # physical card when you print at "Actual Size / 100%".
-    #
-    # card_width_mm  = 85.6   ← exact CR80 (use if your printer does NOT scale)
-    # card_width_mm  = 88.0   ← +2.4 mm compensates for ~3% printer scaling
-    # card_width_mm  = 90.0   ← +4.4 mm compensates for ~5% printer scaling
-    card_width_mm  = 86.0   # ← adjust this until printed width  == 8.5 cm
-    card_height_mm = 55.0   # ← adjust this until printed height == 5.4 cm
-
-    target_w = int(card_width_mm  / 25.4 * dpi)   # 2772 px at 800 DPI
-    target_h = int(card_height_mm / 25.4 * dpi)   # 1748 px at 800 DPI
-
-    front_resized = front_card.resize((target_w, target_h), Image.LANCZOS)
-    back_resized  = back_card.resize((target_w, target_h), Image.LANCZOS)
+    back_card  = composed_id.crop((2733, 0, 5460, 1710))
 
     # Mirror each half (required for PVC film / dragon sheet printing)
-    front_mirrored = mirror_image(front_resized)
-    back_mirrored  = mirror_image(back_resized)
+    front_mirrored = mirror_image(front_card)
+    back_mirrored  = mirror_image(back_card)
 
     # ── GAP & TOP MARGIN ──────────────────────────────────────────────────────
     gap_mm        = 5.0    # gap between cards — space for the fold line
     top_margin_mm = 2.0    # set to 0.0 for borderless printing
 
-    gap      = int(gap_mm        / 25.4 * dpi)
+    # Force gap to be an even number of pixels to ensure mathematically perfect centering
+    gap      = int(gap_mm        / 25.4 * dpi) // 2 * 2
     y_offset = int(top_margin_mm / 25.4 * dpi)
 
     # ── HORIZONTAL CENTERING ──────────────────────────────────────────────────
     # Center the entire combined block (front + gap + back) on the A4 page.
+    target_w    = 2727
+    target_h    = 1710
     total_width = target_w * 2 + gap
     block_x     = (a4_w - total_width) // 2    # left edge of the combined block
     front_x     = block_x
@@ -542,8 +645,8 @@ def create_a4_printable(composed_id: Image.Image) -> Image.Image:
     # ── FOLD GUIDE LINE ───────────────────────────────────────────────────────
     # Draw a thin vertical line at the exact center of the gap.
     # Fold the PVC film along this line to align front and back.
-    fold_x         = block_x + target_w + gap // 2   # center of the gap
-    fold_thickness = max(3, int(0.4 / 25.4 * dpi))   # 0.4 mm ≈ 13 px
+    fold_x         = block_x + target_w + gap // 2   # center of the gap (and center of A4 page!)
+    fold_thickness = max(3, int(0.4 / 25.4 * dpi))   # 0.4 mm ≈ 12 px
     fold_color     = (20, 20, 20)                     # near-black
     draw = ImageDraw.Draw(canvas)
     draw.line(
@@ -552,7 +655,7 @@ def create_a4_printable(composed_id: Image.Image) -> Image.Image:
         width=fold_thickness,
     )
 
-    return canvas
+    return canvas, dpi
 
 
 # ─── Legacy helpers kept for backwards compatibility ──────────────────────────

@@ -293,13 +293,12 @@ async def generate_card_and_send(query: CallbackQuery, context: ContextTypes.DEF
         result = compose_id(data, photo, qr, template_path=TEMPLATE_PATH)
 
         # Step 3b: Mirror the card and create the A4 printable version
-        logger.info("Mirroring card and creating A4 PDF...")
+        logger.info("Mirroring card and creating A4 printable canvas...")
         mirrored_card = mirror_image(result)
-        a4_canvas = create_a4_printable(result)
+        a4_canvas, pdf_dpi = create_a4_printable(result)
 
         # Step 4: Send results back
-        # PNG: Send as a visible inline photo (not a downloadable file)
-        # Downsize for Telegram display — users print from the PDF, not the PNG
+        # JPEG: Send as a visible inline photo preview (downsized for chat display)
         display_card = mirrored_card.copy()
         max_display_w = 1280
         if display_card.width > max_display_w:
@@ -307,26 +306,27 @@ async def generate_card_and_send(query: CallbackQuery, context: ContextTypes.DEF
             display_card = display_card.resize(
                 (max_display_w, int(display_card.height * ratio)), Image.LANCZOS
             )
-        png_buf = io.BytesIO()
-        display_card.save(png_buf, format="JPEG", quality=85)
-        png_buf.seek(0)
+        preview_buf = io.BytesIO()
+        display_card.save(preview_buf, format="JPEG", quality=85)
+        preview_buf.seek(0)
 
-        pdf_buf = io.BytesIO()
-        a4_canvas.save(pdf_buf, format="PDF", resolution=800.0, quality=100)
-        pdf_buf.seek(0)
+        # Lossless A4 PNG: Send as a document (preserving exact printing resolution and DPI metadata)
+        a4_png_buf = io.BytesIO()
+        a4_canvas.save(a4_png_buf, format="PNG", dpi=(pdf_dpi, pdf_dpi))
+        a4_png_buf.seek(0)
 
         # Send the card as a visible photo in the chat
         await query.message.reply_photo(
-            photo=png_buf,
+            photo=preview_buf,
             caption="🪪 Mirrored Physical ID Card Preview",
             write_timeout=60,
         )
 
-        # Send the high-quality printable A4 PDF as a downloadable document
+        # Send the high-quality printable A4 PNG as a downloadable document
         await query.message.reply_document(
-            document=pdf_buf,
-            filename="fayda_printable_a4.pdf",
-            caption="🖨️ Printable A4 PDF — print this file for the physical card",
+            document=a4_png_buf,
+            filename="fayda_printable_a4.png",
+            caption="🖨️ Lossless A4 PNG — print this file at 100% scale for exact physical card sizing",
             write_timeout=180,
             disable_content_type_detection=True,
         )
