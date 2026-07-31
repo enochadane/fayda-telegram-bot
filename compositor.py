@@ -28,7 +28,7 @@ Back half coordinate reference (relative x offset from BACK_OFFSET=2739):
 
 import io
 import os
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
 import barcode
 from barcode.writer import ImageWriter
 
@@ -100,7 +100,7 @@ def _generate_barcode_image(fan_number: str,
     if bbox:
         barcode_img = barcode_img.crop(bbox)
 
-    barcode_img = barcode_img.resize((target_width, target_height), Image.LANCZOS)
+    barcode_img = barcode_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
     return barcode_img
 
 
@@ -257,6 +257,32 @@ def _paste_rotated_text(canvas: Image.Image, text: str, font: ImageFont.FreeType
     canvas.paste(rotated, (paste_x, paste_y), rotated)
 
 
+def _get_photo_bg_color(img: Image.Image) -> tuple:
+    """
+    Sample top corners/edges of the photo image to detect its original background color.
+    Returns an (R, G, B) tuple.
+    """
+    img_rgb = img.convert("RGB")
+    w, h = img_rgb.size
+    pixels = []
+    # Sample top-left corner
+    for x in range(min(25, w)):
+        for y in range(min(25, h)):
+            pixels.append(img_rgb.getpixel((x, y)))
+    # Sample top-right corner
+    for x in range(max(0, w - 25), w):
+        for y in range(min(25, h)):
+            pixels.append(img_rgb.getpixel((x, y)))
+
+    if not pixels:
+        return (240, 240, 240)
+
+    r = int(sum(p[0] for p in pixels) / len(pixels))
+    g = int(sum(p[1] for p in pixels) / len(pixels))
+    b = int(sum(p[2] for p in pixels) / len(pixels))
+    return (r, g, b)
+
+
 def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
                template_path: str = TEMPLATE_PATH) -> Image.Image:
     """
@@ -279,138 +305,60 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Step F1: Paste photo into the humanoid silhouette ─────────────────────
-    photo_box_x1, photo_box_y1 = 202,  330
-    photo_box_x2, photo_box_y2 = 930, 1434
+    # === ADJUSTABLE MAIN PHOTO CONTROLS ===
+    # 1. Box position on card canvas (y1=390 aligns with top of "Full Name" label)
+    photo_box_x1, photo_box_y1 = 160, 350
+    photo_box_x2, photo_box_y2 = 980, 1484
     photo_box_w = photo_box_x2 - photo_box_x1   # 728
-    photo_box_h = photo_box_y2 - photo_box_y1   # 1104
+    photo_box_h = photo_box_y2 - photo_box_y1   # 1044
 
-    src_w, src_h = photo_image.size
+    # 2. Framing focus inside photo box:
+    #    center_y: 0.0 (top of photo), 0.5 (middle), 0.55 (head near top + shoulders visible), 1.0 (bottom)
+    #    center_x: 0.0 (left), 0.5 (center), 1.0 (right)
+    main_photo_center_x = 0.5
+    main_photo_center_y = 0.55
 
-    # ── Position photo so the full portrait (head→shoulders) is visible ─────────
-    #
-    # Scale to fill the full silhouette width (matches physical card style).
-    # === ZOOM CONTROL FOR MAIN PHOTO ===
-    # Decrease this value to zoom out (e.g. 0.95), increase to zoom in (e.g. 1.05)
-    main_photo_zoom = 0.93
-    
-    # Remove white background to prevent boxy edges and eat the white halo
-    photo_clean = remove_white_background_smooth(photo_image, tolerance=30, use_min_filter=True)
-    
-    scale = (photo_box_w / src_w) * main_photo_zoom
-    new_w = int(photo_box_w * main_photo_zoom)
-    new_h = int(src_h * scale)
-    photo_resized = photo_clean.resize((new_w, new_h), Image.LANCZOS)
+    # 3. Zoom level (1.0 = standard fit, 1.10 = zoom in 10%, 0.90 = zoom out 10%)
+    main_photo_zoom = 1.05
 
-    # ── Photo processing: convert to grayscale + enhance ──────────────────
-    # Physical Ethiopian ID cards print the portrait in black & white.
-    # Convert RGB channels to grayscale but preserve the alpha channel!
-    r_ch, g_ch, b_ch, a_ch = photo_resized.split()
-    photo_gray_l = Image.merge("RGB", (r_ch, g_ch, b_ch)).convert("L")
-    photo_gray_l = ImageEnhance.Contrast(photo_gray_l).enhance(1.15)  # subtle contrast boost
-    photo_gray_l = ImageEnhance.Sharpness(photo_gray_l).enhance(1.3)  # sharpen after resize
-    photo_resized = Image.merge("RGBA", (photo_gray_l, photo_gray_l, photo_gray_l, a_ch))
-
-    # Place the BOTTOM of the photo at 99.9 % of the silhouette box height.
-    # This way the shoulders sit near the bottom-centre of the silhouette and
-    # the face / head naturally appear in the upper portion.
-    bottom_anchor = int(photo_box_h * 1.05)  # canvas y where photo bottom lands
-    y_offset = bottom_anchor - new_h          # where the photo TOP starts (can be negative)
-    x_offset = (photo_box_w - new_w) // 2     # center horizontally
-
-    # === PHOTO BACKGROUND: WAVE PATTERN FROM TEMPLATE ===
-    # Reconstruct the card's guilloché wave pattern behind the person.
-    # We reconstruct the entire photo box background (728 × 1104 px) by walking
-    # horizontally in steps of the wave period (13px) to find clean wave pixels
-    # at the left (< 215) and right (> 915) edges of the front template.
-    # Linear blending weights transition smoothly between the left and right sources,
-    # preserving the background's colors, phase, and vertical consistency without seams.
-    _WAVE_PERIOD = 13
-    _fb_path = os.path.join(os.path.dirname(os.path.abspath(template_path)), "front_blank.png")
-    _front_blank = Image.open(_fb_path).convert("RGB")
-
-    # Crop the photo box area from front_blank
-    _fb_crop = _front_blank.crop((photo_box_x1, photo_box_y1, photo_box_x2, photo_box_y2))
-    _bg_px = _fb_crop.load()
-    _orig_px = _front_blank.load()
-
-    # Precompute clean x positions and blending weights for each column
-    _x_map = []
-    for _x_rel in range(photo_box_w):
-        _x_abs = photo_box_x1 + _x_rel
-        
-        # Walk left to find clean pixel (< 215)
-        _x_left = _x_abs
-        while _x_left >= 215:
-            _x_left -= _WAVE_PERIOD
-            
-        # Walk right to find clean pixel (> 915)
-        _x_right = _x_abs
-        while _x_right <= 915:
-            _x_right += _WAVE_PERIOD
-            
-        _weight_left = (photo_box_w - 1 - _x_rel) / (photo_box_w - 1)
-        _weight_right = 1.0 - _weight_left
-        _x_map.append((_x_left, _x_right, _weight_left, _weight_right))
-
-    for _y_rel in range(photo_box_h):
-        _y_abs = photo_box_y1 + _y_rel
-        for _x_rel in range(photo_box_w):
-            _x_left, _x_right, _weight_left, _weight_right = _x_map[_x_rel]
-            
-            _r_l, _g_l, _b_l = _orig_px[_x_left, _y_abs]
-            _r_r, _g_r, _b_r = _orig_px[_x_right, _y_abs]
-            
-            _r = int(_r_l * _weight_left + _r_r * _weight_right)
-            _g = int(_g_l * _weight_left + _g_r * _weight_right)
-            _b = int(_b_l * _weight_left + _b_r * _weight_right)
-            
-            _bg_px[_x_rel, _y_rel] = (_r, _g, _b)
-
-    photo_canvas = _fb_crop.convert("RGBA")
-    photo_canvas.paste(photo_resized, (x_offset, y_offset), photo_resized)
+    photo_rgb = photo_image.convert("RGB")
+    fit_w = int(photo_box_w * main_photo_zoom)
+    fit_h = int(photo_box_h * main_photo_zoom)
+    photo_resized = ImageOps.fit(photo_rgb, (fit_w, fit_h), method=Image.Resampling.LANCZOS, centering=(main_photo_center_x, main_photo_center_y))
+    if main_photo_zoom != 1.0:
+        crop_x = (fit_w - photo_box_w) // 2
+        crop_y = (fit_h - photo_box_h) // 2
+        photo_resized = photo_resized.crop((crop_x, crop_y, crop_x + photo_box_w, crop_y + photo_box_h))
 
     # Paste final composed photo box back into template
-    template.paste(photo_canvas.convert("RGB"), (photo_box_x1, photo_box_y1))
+    template.paste(photo_resized, (photo_box_x1, photo_box_y1))
 
 
     # ── Step F1b: Ghost / watermark photo — semi-transparent portrait overlay ──
-    # In the expected output the ghost portrait sits over the lower-right
-    # decorative green-wave area of the front card.
+    # === ADJUSTABLE GHOST PHOTO CONTROLS ===
     ghost_x1, ghost_y1 = 2130, 1195
     ghost_x2, ghost_y2 = 2470, 1558
     ghost_w = ghost_x2 - ghost_x1   # 340
     ghost_h = ghost_y2 - ghost_y1   # 363
 
-    # Ghost photo: same bottom-anchor approach.
-    # Anchor the photo bottom at 92 % of the ghost box so face + shoulders show.
-    # === ZOOM CONTROL FOR GHOST PHOTO ===
-    # Decrease this value to zoom out (e.g. 0.95), increase to zoom in (e.g. 1.05)
-    ghost_photo_zoom = 0.75
-    
-    # For the ghost photo, also remove the white background to prevent a semi-transparent white box and eat the white halo
-    ghost_clean = remove_white_background_smooth(photo_image, tolerance=30, use_min_filter=True)
-    
-    ghost_scale   = (ghost_w / src_w) * ghost_photo_zoom
-    ghost_new_w   = int(ghost_w * ghost_photo_zoom)
-    ghost_new_h   = int(src_h * ghost_scale)
-    ghost_resized = ghost_clean.resize((ghost_new_w, ghost_new_h), Image.LANCZOS)
-    
-    # Ghost also in grayscale for consistency with the main photo
-    g_r, g_g, g_b, g_a = ghost_resized.split()
-    ghost_gray_l = Image.merge("RGB", (g_r, g_g, g_b)).convert("L")
-    ghost_resized = Image.merge("RGBA", (ghost_gray_l, ghost_gray_l, ghost_gray_l, g_a))
+    ghost_photo_center_x = 0.5
+    ghost_photo_center_y = 0.55
+    ghost_photo_zoom = 1.0
+    ghost_opacity = 0.25   # Opacity (0.0 to 1.0): 0.25 = 25% opacity
 
-    ghost_bottom_anchor = int(ghost_h * 1.05)
-    ghost_y_offset      = ghost_bottom_anchor - ghost_new_h   # can be negative
-    ghost_x_offset      = (ghost_w - ghost_new_w) // 2     # center horizontally
+    ghost_rgb = photo_image.convert("RGB")
+    g_fit_w = int(ghost_w * ghost_photo_zoom)
+    g_fit_h = int(ghost_h * ghost_photo_zoom)
+    ghost_resized = ImageOps.fit(ghost_rgb, (g_fit_w, g_fit_h), method=Image.Resampling.LANCZOS, centering=(ghost_photo_center_x, ghost_photo_center_y))
+    if ghost_photo_zoom != 1.0:
+        g_crop_x = (g_fit_w - ghost_w) // 2
+        g_crop_y = (g_fit_h - ghost_h) // 2
+        ghost_resized = ghost_resized.crop((g_crop_x, g_crop_y, g_crop_x + ghost_w, g_crop_y + ghost_h))
 
-    # Create a transparent canvas to paste the resized ghost photo onto
-    ghost_canvas = Image.new("RGBA", (ghost_w, ghost_h), (0, 0, 0, 0))
-    ghost_canvas.paste(ghost_resized, (ghost_x_offset, ghost_y_offset), ghost_resized)
-
-    # Apply ~25% opacity so the card background security pattern shows through
-    r_ch, g_ch, b_ch, a_ch = ghost_canvas.split()
-    a_ch = a_ch.point(lambda p: int(p * 0.25))
+    # Apply opacity so card background security pattern shows through
+    ghost_rgba = ghost_resized.convert("RGBA")
+    r_ch, g_ch, b_ch, a_ch = ghost_rgba.split()
+    a_ch = a_ch.point(lambda p: int(p * ghost_opacity))
     ghost_rgba = Image.merge("RGBA", (r_ch, g_ch, b_ch, a_ch))
     template.paste(ghost_rgba, (ghost_x1, ghost_y1), ghost_rgba)
 
@@ -567,7 +515,7 @@ def compose_id(data: dict, photo_image: Image.Image, qr_image: Image.Image,
 
     # ── QR Code  (rel x=1260–2580, y=130–1450) ─────────────────────────────────
     qr_target_size = 1320
-    qr_copy = qr_image.copy().resize((qr_target_size, qr_target_size), Image.LANCZOS)
+    qr_copy = qr_image.copy().resize((qr_target_size, qr_target_size), Image.Resampling.LANCZOS)
     if qr_copy.mode != "RGBA":
         qr_copy = qr_copy.convert("RGBA")
 
@@ -587,34 +535,122 @@ def mirror_image(image: Image.Image) -> Image.Image:
     return image.transpose(Image.FLIP_LEFT_RIGHT)
 
 
+def _make_bleed_card(
+    card_img: Image.Image,
+    card_px_w: int,
+    card_px_h: int,
+    bleed_px_w: int,
+    bleed_px_h: int,
+    sharpen_factor: float = 1.25,
+) -> Image.Image:
+    """
+    Scale a card image to the physical CR80 content size, wrap it in a bleed
+    border filled with the card's own background colour, then apply a subtle
+    sharpness enhancement pass to crisp up micro-text and barcode edges.
+
+    The bleed zone is filled with an averaged sample of the card's four corner
+    pixels (5×5 region each), giving a seamless extension of the background
+    colour so the die-cutter blade cuts through background — not raw white PVC.
+
+    Args:
+        card_img:       Source card image (any size, RGB or RGBA).
+        card_px_w:      Target pixel width  for the inner CR80 content area.
+        card_px_h:      Target pixel height for the inner CR80 content area.
+        bleed_px_w:     Total pixel width  including bleed on both sides.
+        bleed_px_h:     Total pixel height including bleed on both sides.
+        sharpen_factor: ImageEnhance.Sharpness factor (1.0 = unchanged).
+                        Recommended range: 1.2 – 1.3.
+
+    Returns:
+        RGB Image of size (bleed_px_w × bleed_px_h).
+    """
+    # 1. Scale card content to exact CR80 pixel dimensions
+    card_rgb = card_img.convert("RGB")
+    scaled = card_rgb.resize((card_px_w, card_px_h), Image.Resampling.LANCZOS)
+
+    # 2. Sample background colour: average all four 5×5 px corner regions
+    sample = 5
+    corners = [
+        scaled.crop((0,                  0,                  sample,      sample)),
+        scaled.crop((card_px_w - sample, 0,                  card_px_w,   sample)),
+        scaled.crop((0,                  card_px_h - sample, sample,      card_px_h)),
+        scaled.crop((card_px_w - sample, card_px_h - sample, card_px_w,   card_px_h)),
+    ]
+    all_px = [px[:3] for corner in corners for px in corner.getdata()]
+    n = len(all_px)
+    bg_color = (
+        int(sum(p[0] for p in all_px) / n),
+        int(sum(p[1] for p in all_px) / n),
+        int(sum(p[2] for p in all_px) / n),
+    )
+
+    # 3. Create bleed canvas filled with the sampled background colour
+    bleed_x = (bleed_px_w - card_px_w) // 2
+    bleed_y = (bleed_px_h - card_px_h) // 2
+    bleed_canvas = Image.new("RGB", (bleed_px_w, bleed_px_h), bg_color)
+    bleed_canvas.paste(scaled, (bleed_x, bleed_y))
+
+    # 4. Sharpness enhancement — crisp up micro-text and barcode edges
+    return ImageEnhance.Sharpness(bleed_canvas).enhance(sharpen_factor)
+
+
 def create_a4_printable(composed_id: Image.Image) -> tuple:
     """
-    Place the mirrored front and back ID cards side-by-side at the very top of an A4 portrait page.
+    Place the mirrored front and back ID cards side-by-side at the very top of
+    an A4 portrait page, rendered at a fixed 600 DPI with a proper CR80 bleed
+    architecture.
 
-    - Card dimensions are mathematically aligned to native resolution to prevent resizing blur.
-    - A thin vertical fold guide line is drawn in the center of the gap for PVC film folding.
-    - The entire card block is horizontally centered on the A4 page.
+    Bleed Architecture
+    ------------------
+    The card layout separates two distinct regions:
+
+    1. **CR80 content area** (85.6 mm × 53.98 mm) — all critical inner content
+       (names, photo, QR code, micro-text, borders) is scaled to this exact
+       physical cut size. Nothing important lives outside this boundary.
+
+    2. **Bleed zone** (88.5 mm × 55.8 mm total) — only the background colour
+       extends outward ~1.45 mm on each side. When the die-cutter blade
+       cuts along the CR80 boundary it passes through background colour,
+       so no raw white PVC edge is exposed on the finished card.
+
+    Output
+    ------
+    - Canvas: exactly 210.0 mm × 297.0 mm at 600 DPI → 4961 × 7016 px.
+    - Strict A4 1:√2 aspect ratio — printing software cannot auto-stretch.
+    - All resize operations use LANCZOS; a 1.25× sharpness pass is applied
+      to each bleed card before pasting to sharpen micro-text and barcodes.
+    - Returns (canvas, dpi) where dpi is always 600.
     """
-    # ── CARD SIZE CONTROL ──────────────────────────────────────────────────────
-    # Standard CR80 physical card: 85.6 mm × 53.98 mm
-    # Most home/office printers scale PDFs down by 2-5%.
-    # We increase the target dimensions to compensate for typical printer scaling.
-    # Adjust card_width_mm until your printer prints it at exactly 85.6 mm.
-    card_width_mm = 88.5   # ← increase if printed card is too small, decrease if too large
-    
-    # We crop both front and back halves at exactly 2727 x 1710 pixels.
-    # To avoid resizing blur, we do NOT scale the cards. Instead, we dynamically
-    # calculate the PDF's DPI so that 2727 pixels renders at card_width_mm.
-    dpi = (2727.0 * 25.4) / card_width_mm  # e.g., 782.66 DPI for 88.5 mm
+    # ── CONSTANTS ─────────────────────────────────────────────────────────────
+    TARGET_DPI  = 600
+    PX_PER_MM   = TARGET_DPI / 25.4   # ≈ 23.622 px per mm
 
-    # A4 page dimensions in pixels at dynamic DPI
-    a4_w = int(210.0 / 25.4 * dpi)   # ~6470 px = 210.0 mm
-    a4_h = int(297.0 / 25.4 * dpi)   # ~9152 px = 297.0 mm
+    # Physical card cut boundary — all inner content must stay inside this
+    CR80_W_MM   = 86.5
+    CR80_H_MM   = 54.55
+
+    # Bleed extent — background colour extended ~1.45 mm per side (horizontal)
+    #                                          ~0.91 mm per side (vertical)
+    BLEED_W_MM  = 89.4
+    BLEED_H_MM  = 56.37
+
+    # A4 page — strict 1:√2 ratio at 600 DPI
+    A4_W_MM     = 210.0
+    A4_H_MM     = 297.0
+
+    # ── PIXEL DIMENSIONS ──────────────────────────────────────────────────────
+    card_px_w  = round(CR80_W_MM  * PX_PER_MM)   # ≈ 2020 px  (85.6 mm)
+    card_px_h  = round(CR80_H_MM  * PX_PER_MM)   # ≈ 1275 px  (53.98 mm)
+    bleed_px_w = round(BLEED_W_MM * PX_PER_MM)   # ≈ 2087 px  (88.5 mm)
+    bleed_px_h = round(BLEED_H_MM * PX_PER_MM)   # ≈ 1317 px  (55.8 mm)
+
+    a4_w = round(A4_W_MM * PX_PER_MM)            # 4961 px  (210.0 mm)
+    a4_h = round(A4_H_MM * PX_PER_MM)            # 7016 px  (297.0 mm)
 
     canvas = Image.new("RGB", (a4_w, a4_h), (255, 255, 255))
 
-    # Extract front and back halves from the combined template image.
-    # We crop them both to exactly 2727 px wide to keep them identical in size.
+    # ── EXTRACT & MIRROR CARDS ────────────────────────────────────────────────
+    # Crop front and back halves from the combined template at native resolution
     front_card = composed_id.crop((0,    0, 2727, 1710))
     back_card  = composed_id.crop((2733, 0, 5460, 1710))
 
@@ -622,40 +658,56 @@ def create_a4_printable(composed_id: Image.Image) -> tuple:
     front_mirrored = mirror_image(front_card)
     back_mirrored  = mirror_image(back_card)
 
-    # ── GAP & TOP MARGIN ──────────────────────────────────────────────────────
-    gap_mm        = 5.0    # gap between cards — space for the fold line
-    top_margin_mm = 2.0    # set to 0.0 for borderless printing
+    # ── BUILD BLEED CARDS ─────────────────────────────────────────────────────
+    # Each bleed card:
+    #   • inner content → scaled to CR80 px size via LANCZOS
+    #   • outer border  → filled with card's own corner-sampled background colour
+    #   • sharpness pass applied (factor 1.25) before pasting
+    front_bleed = _make_bleed_card(
+        front_mirrored,
+        card_px_w, card_px_h,
+        bleed_px_w, bleed_px_h,
+        sharpen_factor=1.25,
+    )
+    back_bleed = _make_bleed_card(
+        back_mirrored,
+        card_px_w, card_px_h,
+        bleed_px_w, bleed_px_h,
+        sharpen_factor=1.25,
+    )
 
-    # Force gap to be an even number of pixels to ensure mathematically perfect centering
-    gap      = int(gap_mm        / 25.4 * dpi) // 2 * 2
-    y_offset = int(top_margin_mm / 25.4 * dpi)
+    # ── GAP & TOP MARGIN ──────────────────────────────────────────────────────
+    gap_mm        = 5.0   # gap between cards — space for the fold guide line
+    top_margin_mm = 0.0   # 0.0 for borderless printing; increase for top margin
+
+    # Force gap to an even pixel count for mathematically perfect centering
+    gap      = (round(gap_mm        * PX_PER_MM) // 2) * 2   # ≈ 118 px
+    y_offset =  round(top_margin_mm * PX_PER_MM)              # 0 px
 
     # ── HORIZONTAL CENTERING ──────────────────────────────────────────────────
-    # Center the entire combined block (front + gap + back) on the A4 page.
-    target_w    = 2727
-    target_h    = 1710
-    total_width = target_w * 2 + gap
-    block_x     = (a4_w - total_width) // 2    # left edge of the combined block
+    # Center the entire combined block (front_bleed + gap + back_bleed) on A4
+    total_width = bleed_px_w * 2 + gap
+    block_x     = (a4_w - total_width) // 2   # left edge of the combined block
     front_x     = block_x
-    back_x      = block_x + target_w + gap
+    back_x      = block_x + bleed_px_w + gap
 
-    canvas.paste(front_mirrored, (front_x, y_offset))
-    canvas.paste(back_mirrored,  (back_x,  y_offset))
+    canvas.paste(front_bleed, (front_x, y_offset))
+    canvas.paste(back_bleed,  (back_x,  y_offset))
 
     # ── FOLD GUIDE LINE ───────────────────────────────────────────────────────
-    # Draw a thin vertical line at the exact center of the gap.
+    # Thin vertical line at the exact centre of the gap.
     # Fold the PVC film along this line to align front and back.
-    fold_x         = block_x + target_w + gap // 2   # center of the gap (and center of A4 page!)
-    fold_thickness = max(3, int(0.4 / 25.4 * dpi))   # 0.4 mm ≈ 12 px
-    fold_color     = (20, 20, 20)                     # near-black
+    fold_x         = block_x + bleed_px_w + gap // 2
+    fold_thickness = max(3, round(0.4 * PX_PER_MM))   # 0.4 mm ≈ 9 px at 600 DPI
+    fold_color     = (20, 20, 20)
     draw = ImageDraw.Draw(canvas)
     draw.line(
-        [(fold_x, y_offset), (fold_x, y_offset + target_h)],
+        [(fold_x, y_offset), (fold_x, y_offset + bleed_px_h)],
         fill=fold_color,
         width=fold_thickness,
     )
 
-    return canvas, dpi
+    return canvas, TARGET_DPI
 
 
 # ─── Legacy helpers kept for backwards compatibility ──────────────────────────

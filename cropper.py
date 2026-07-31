@@ -37,10 +37,10 @@ def crop_photo(front_image: Image.Image) -> Image.Image:
     # Exact ratios derived from pixel scan of sample-input/front.PNG (1110x1779):
     # Grey photo box: left=429, top=380, right=709, bottom=946
     # These exclude white borders and the gold wave at the bottom.
-    left   = int(w * 0.324)
-    right  = int(w * 0.689)
-    top    = status_bar_height + int((h - status_bar_height) * 0.144)
-    bottom = status_bar_height + int((h - status_bar_height) * 0.525)
+    left   = int(w * 0.100)
+    right  = int(w * 0.900)
+    top    = status_bar_height + int((h - status_bar_height) * 0.120)
+    bottom = status_bar_height + int((h - status_bar_height) * 0.488)
 
     photo = front_image.crop((left, top, right, bottom))
     return photo
