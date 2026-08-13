@@ -40,7 +40,7 @@ def crop_photo(front_image: Image.Image) -> Image.Image:
     left   = int(w * 0.100)
     right  = int(w * 0.900)
     top    = status_bar_height + int((h - status_bar_height) * 0.120)
-    bottom = status_bar_height + int((h - status_bar_height) * 0.488)
+    bottom = status_bar_height + int((h - status_bar_height) * 0.460)
 
     photo = front_image.crop((left, top, right, bottom))
     return photo

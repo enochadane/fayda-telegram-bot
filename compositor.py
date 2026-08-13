@@ -225,25 +225,44 @@ def _paste_rotated_text(canvas: Image.Image, text: str, font: ImageFont.FreeType
     (so it reads from bottom to top along the card's left edge), then paste
     it onto `canvas` centered horizontally at `x_center`.
 
+    Uses 4× supersampling: text is drawn at 4× the target size then downscaled
+    with LANCZOS before pasting, producing sharp, anti-aliased edges instead of
+    the blurry result caused by low-resolution rotation resampling.
+
     If `align_bottom` is True, `y` is treated as the bottom limit of the text (y_end).
     Otherwise, `y` is treated as the top starting position (y_start).
     """
-    # Measure the text so we can size the temporary image exactly
+    SCALE = 4  # supersampling factor — render at 4× then downscale
+
+    # Load a scaled-up version of the font for supersampled rendering
+    font_ss: ImageFont.FreeTypeFont
+    try:
+        font_ss = ImageFont.truetype(font.path, font.size * SCALE)  # type: ignore[attr-defined]
+    except Exception:
+        font_ss = font  # fallback: use original font if path unavailable
+
+    # Measure text at the supersampled font size
     tmp_img  = Image.new("RGBA", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_img)
-    tbbox    = tmp_draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
-    txt_w    = tbbox[2] - tbbox[0] + 20
-    txt_h    = tbbox[3] - tbbox[1] + 16
+    stroke_ss = stroke * SCALE
+    tbbox    = tmp_draw.textbbox((0, 0), text, font=font_ss, stroke_width=stroke_ss)
+    txt_w    = tbbox[2] - tbbox[0] + 20 * SCALE
+    txt_h    = tbbox[3] - tbbox[1] + 16 * SCALE
 
-    # Draw text onto temporary image
+    # Draw text onto supersampled temporary image
     txt_img  = Image.new("RGBA", (txt_w, txt_h), (0, 0, 0, 0))
     txt_draw = ImageDraw.Draw(txt_img)
-    txt_draw.text((10 - tbbox[0], 8 - tbbox[1]), text,
-                  fill=fill, font=font,
-                  stroke_width=stroke, stroke_fill=fill)
+    txt_draw.text((10 * SCALE - tbbox[0], 8 * SCALE - tbbox[1]), text,
+                  fill=fill, font=font_ss,
+                  stroke_width=stroke_ss, stroke_fill=fill)
 
-    # Rotate 90° CCW → text runs from bottom of card upward
-    rotated = txt_img.rotate(90, expand=True)
+    # Rotate 90° CCW at high resolution → text runs from bottom of card upward
+    rotated_ss = txt_img.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+
+    # Downscale to target size with LANCZOS for maximum sharpness
+    target_w = rotated_ss.width  // SCALE
+    target_h = rotated_ss.height // SCALE
+    rotated  = rotated_ss.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
     # Center text horizontally at x_center
     paste_x = x_center - rotated.width // 2
